@@ -522,18 +522,121 @@
             formatNumber(n,c=false) { if(n===undefined||isNaN(n)) return '0'; n=parseFloat(n); return c ? n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : (Math.abs(n)>=1 ? n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : (n===0?'0.00':n.toFixed(6))); },
 
             calculatePortfolio() {
-                const assets = {}; let usdtBalance=0, totalInvested=0, realizedPnL=0;
-                const active = this.data.transactions.filter(t=>!t.deleted);
-                active.sort((a,b)=>new Date(a.date)-new Date(b.date));
+                const assets = { 'USDT': { amount: 0, locked: 0, cost: 0 } };
+                let usdtBalance = 0;
+                let totalInvested = 0; 
+                let realizedPnL = 0;
+
+                // Lọc và sắp xếp giao dịch theo thời gian để tính đúng dòng tiền
+                const active = this.data.transactions.filter(t => !t.deleted);
+                active.sort((a,b) => new Date(a.date) - new Date(b.date));
+
+                // Helper để khởi tạo object asset nếu chưa có
+                const ensureAsset = (coin) => {
+                    if(!assets[coin]) assets[coin] = {amount:0, locked:0, cost:0};
+                };
+
                 active.forEach(tx => {
-                    const amt = parseFloat(tx.amount)||0, total=parseFloat(tx.total)||0, fee=parseFloat(tx.fee)||0;
-                    if(tx.type==='deposit') { usdtBalance += (amt - fee); totalInvested += (amt - fee); }
-                    else if(tx.type==='withdraw') { usdtBalance -= (amt + fee); totalInvested -= (amt + fee); }
-                    else if(tx.type==='buy') { if(!assets[tx.coin]) assets[tx.coin]={amount:0,locked:0,cost:0}; assets[tx.coin].amount += amt; assets[tx.coin].cost += (total + fee); usdtBalance -= (total + fee); }
-                    else if(tx.type==='sell') { if(assets[tx.coin]) { const avg = assets[tx.coin].cost/(assets[tx.coin].amount+assets[tx.coin].locked || 1); const proceeds = total - fee; realizedPnL += proceeds - (amt * avg); assets[tx.coin].amount -= amt; assets[tx.coin].cost -= (amt*avg); usdtBalance += proceeds; } }
-                    else if(tx.type==='di_entry') { if(tx.diType==='sell_high') { if(!assets[tx.coin]) assets[tx.coin]={amount:0,locked:0,cost:0}; assets[tx.coin].amount -= amt; assets[tx.coin].locked += amt; } else { usdtBalance -= amt; if(!assets['USDT']) assets['USDT']={amount:0,locked:0,cost:0}; assets['USDT'].locked += amt; } }
-                    else if(tx.type==='di_settle') { const p = active.find(x=>x.id===tx.parentDiId); if(p) { const res = parseFloat(tx.resultAmount)||0; if(p.diType==='sell_high') { assets[p.coin].locked -= p.amount; const avg = assets[p.coin].cost / (assets[p.coin].amount + assets[p.coin].locked + p.amount || 1); if(tx.resultAsset === 'USDT') { realizedPnL += (res - (p.amount * avg)); assets[p.coin].cost -= (p.amount * avg); usdtBalance += res; } else { assets[p.coin].amount += res; } } else { assets['USDT'].locked -= p.amount; if(tx.resultAsset === 'USDT') { realizedPnL += (res - p.amount); usdtBalance += res; } else { if(!assets[tx.resultAsset]) assets[tx.resultAsset]={amount:0,locked:0,cost:0}; assets[tx.resultAsset].amount += res; assets[tx.resultAsset].cost += p.amount; } } } }
+                    const amt = parseFloat(tx.amount)||0;
+                    const total = parseFloat(tx.total)||0; 
+                    const fee = parseFloat(tx.fee)||0;
+
+                    switch(tx.type) {
+                        case 'deposit':
+                            usdtBalance += (amt - fee);
+                            totalInvested += (amt - fee);
+                            ensureAsset('USDT'); assets['USDT'].amount = usdtBalance;
+                            break;
+                        case 'withdraw':
+                            usdtBalance -= (amt + fee);
+                            totalInvested -= (amt + fee);
+                            ensureAsset('USDT'); assets['USDT'].amount = usdtBalance;
+                            break;
+                        case 'buy':
+                            ensureAsset(tx.coin);
+                            usdtBalance -= (total + fee);
+                            assets[tx.coin].amount += amt;
+                            assets[tx.coin].cost += total; // Cost basis tăng theo số tiền chi ra
+                            break;
+                        case 'sell':
+                            ensureAsset(tx.coin);
+                            if(assets[tx.coin].amount > 0) {
+                                // Tính giá trung bình trước khi bán
+                                const avg = assets[tx.coin].cost / (assets[tx.coin].amount + assets[tx.coin].locked); 
+                                const costOfSold = amt * avg;
+                                realizedPnL += (total - fee) - costOfSold;
+                                assets[tx.coin].cost -= costOfSold;
+                                assets[tx.coin].amount -= amt;
+                                usdtBalance += (total - fee);
+                            }
+                            break;
+
+                        // --- LOGIC DUAL INVESTMENT CHUẨN KẾ TOÁN ---
+                        case 'di_entry':
+                            if(tx.diType === 'sell_high') {
+                                // Lock Crypto: Chuyển từ Available sang Locked. Giá vốn (Cost) GIỮ NGUYÊN.
+                                ensureAsset(tx.coin);
+                                assets[tx.coin].amount -= amt;
+                                assets[tx.coin].locked += amt;
+                            } else {
+                                // Lock USDT (Buy Low)
+                                usdtBalance -= amt;
+                                ensureAsset('USDT');
+                                assets['USDT'].locked += amt;
+                            }
+                            break;
+
+                        case 'di_settle':
+                            const p = active.find(x => x.id === tx.parentDiId);
+                            if(p) { // Chỉ xử lý nếu lệnh gốc còn tồn tại (chưa bị xóa)
+                                const res = parseFloat(tx.resultAmount)||0;
+                                
+                                if(p.diType === 'sell_high') {
+                                    ensureAsset(p.coin);
+                                    // 1. Mở khóa ảo (trả về trạng thái floating để tính toán)
+                                    assets[p.coin].locked -= p.amount;
+                                    
+                                    if(tx.resultAsset === 'USDT') {
+                                        // TRƯỜNG HỢP KHỚP LỆNH: Bán Coin -> Nhận USDT
+                                        // Tính giá vốn của lượng coin đem đi bán này
+                                        // Tổng coin đang sở hữu (tính cả lượng vừa mở khóa)
+                                        const currentHolding = assets[p.coin].amount + assets[p.coin].locked + p.amount;
+                                        const avgPrice = currentHolding > 0 ? assets[p.coin].cost / currentHolding : 0;
+                                        const costSold = p.amount * avgPrice;
+
+                                        realizedPnL += (res - costSold); // Lãi = USDT nhận về - Giá vốn coin
+                                        assets[p.coin].cost -= costSold;
+                                        usdtBalance += res;
+                                    } else {
+                                        // KHÔNG KHỚP: Nhận lại Coin + Lãi Coin
+                                        assets[p.coin].amount += res; 
+                                        // Cost Basis giữ nguyên -> Giá trung bình giảm xuống (có lợi)
+                                    }
+                                } else {
+                                    // BUY LOW (Dùng USDT)
+                                    ensureAsset('USDT');
+                                    assets['USDT'].locked -= p.amount; // Mở khóa USDT
+
+                                    if(tx.resultAsset === 'USDT') {
+                                        // KHÔNG KHỚP: Nhận về USDT + Lãi
+                                        usdtBalance += res;
+                                        realizedPnL += (res - p.amount); // Lãi thực nhận
+                                    } else {
+                                        // KHỚP LỆNH: Mua được Coin
+                                        ensureAsset(tx.resultAsset);
+                                        assets[tx.resultAsset].amount += res;
+                                        // Giá vốn của lượng Coin mới này chính là số USDT gốc đã bỏ ra (Principal)
+                                        assets[tx.resultAsset].cost += p.amount; 
+                                    }
+                                }
+                            }
+                            break;
+                    }
                 });
+                
+                // Đồng bộ lại số dư USDT lần cuối vào object assets để hiển thị
+                if(assets['USDT']) assets['USDT'].amount = usdtBalance;
+
                 return { assets, usdtBalance, totalInvested, realizedPnL };
             },
 
@@ -621,13 +724,157 @@
             formatMoneyPrivately(v,c=false) { if(this.data.isPrivacyMode) return '******'; return c ? `$${this.formatNumber(v,true)}` : this.formatNumber(v); },
             initDates() { const s = new Date(new Date().getTime() - (new Date().getTimezoneOffset() * 60000)).toISOString().slice(0,16); if(document.getElementById('spot-date')) document.getElementById('spot-date').value = s; if(document.getElementById('di-start-date')) document.getElementById('di-start-date').value = s.slice(0,10); },
             // === MISSING DI FUNCTIONS RESTORED BELOW ===
-            renderDIView() { const ac = document.getElementById('di-list-active'), hi = document.getElementById('di-list-history'); if(!ac || !hi) return; ac.innerHTML = ''; hi.innerHTML = ''; const activeDI = this.data.transactions.filter(t => t.type === 'di_entry' && !t.deleted && !t.settled); activeDI.forEach(d => { const price = this.getRate(d.coin); const isWinCondition = d.diType === 'sell_high' ? (price >= d.targetPrice) : (price <= d.targetPrice); ac.innerHTML += `<div class="glass-panel p-4 rounded-xl border-l-4 ${d.diType==='sell_high'?'border-red-500':'border-emerald-500'} mb-4"><div class="flex justify-between items-start mb-2"><div><span class="font-bold text-white text-sm block">${d.coin}</span><span class="${d.diType==='sell_high'?'text-red-400':'text-emerald-400'} font-bold text-xs">${d.diType.replace('_',' ').toUpperCase()}</span></div><div class="flex gap-2"><button onclick="app.editTransaction('${d.id}')" class="p-1"><i class="fa-solid fa-pen text-neon-blue hover:text-white text-sm"></i></button><button onclick="app.softDel('${d.id}')" class="p-1"><i class="fa-solid fa-trash text-gray-500 hover:text-red-500 text-sm"></i></button></div></div><div class="grid grid-cols-2 gap-2 text-[10px] text-gray-400"><div class="flex flex-col"><span>Target</span><b class="text-white">${d.targetPrice}</b></div><div class="flex flex-col text-right"><span>Current</span><b class="${isWinCondition ? 'text-neon-gold' : 'text-white'}">${this.formatNumber(price)}</b></div><div class="flex flex-col"><span>APR</span><b class="text-neon-gold">${d.apr}%</b></div><div class="flex flex-col text-right"><span>Amount</span><b class="text-white">${this.formatNumber(d.amount)}</b></div></div><div class="flex gap-2 mt-3 justify-end border-t border-gray-700 pt-2"><div class="text-[9px] text-gray-500 flex items-center mr-auto">${d.date.slice(5,10)} + ${d.duration}d</div><button onclick="app.settleDI('${d.id}', false)" class="text-[10px] bg-gray-800 text-gray-300 px-3 py-1.5 rounded hover:bg-gray-700 font-bold">Fail</button><button onclick="app.settleDI('${d.id}', true)" class="text-[10px] bg-neon-gold text-black px-3 py-1.5 rounded hover:bg-yellow-400 font-bold">Win</button></div></div>`; }); const sortF = document.getElementById('di-hist-sort')?document.getElementById('di-hist-sort').value:'desc'; const historyDI = this.data.transactions.filter(t => t.type === 'di_settle' && !t.deleted); historyDI.sort((a,b) => sortF === 'desc' ? new Date(b.date) - new Date(a.date) : new Date(a.date) - new Date(b.date)); historyDI.forEach(h => { const p = this.data.transactions.find(t => t.id === h.parentDiId); if(!p) return; hi.innerHTML += `<tr class="border-b border-gray-800 hover:bg-white/5"><td class="p-3"><div class="font-bold text-white text-xs">${p.coin}</div><div class="text-[9px] text-gray-500">${p.diType.replace('_',' ').toUpperCase()}</div></td><td class="p-3 text-right"><div class="font-bold text-xs text-neon-gold">+${this.formatNumber(h.resultAmount)} <span class="text-[9px] text-gray-400">${h.resultAsset}</span></div><div class="text-[9px] text-gray-500">${h.date.slice(0,10)}</div></td><td class="p-3 text-right w-10"><button onclick="app.softDel('${h.id}')" title="Xóa lịch sử"><i class="fa-solid fa-trash text-gray-600 hover:text-red-500 text-xs"></i></button></td></tr>`; }); },
+            renderDIView() { 
+                const ac = document.getElementById('di-list-active'), hi = document.getElementById('di-list-history'); 
+                if(!ac || !hi) return; 
+                ac.innerHTML = ''; hi.innerHTML = ''; 
+                
+                // Logic lọc: Lấy các lệnh entry chưa xóa và chưa có lệnh settle tương ứng
+                const activeDI = this.data.transactions.filter(t => t.type === 'di_entry' && !t.deleted && !t.settled); 
+                
+                activeDI.forEach(d => { 
+                    const price = this.getRate(d.coin); 
+                    // Kiểm tra điều kiện thắng (Win = Khớp lệnh chuyển đổi)
+                    const isWinCondition = d.diType === 'sell_high' ? (price >= d.targetPrice) : (price <= d.targetPrice); 
+                    
+                    // Tính toán APR hiển thị
+                    const interest = d.amount * (d.apr/100) * (d.duration/365);
+                    const finalVal = d.amount + interest;
+
+                    ac.innerHTML += `
+                    <div class="glass-panel p-4 rounded-xl border-l-4 ${d.diType==='sell_high'?'border-red-500':'border-emerald-500'} mb-4 relative overflow-hidden">
+                        <div class="flex justify-between items-start mb-2 relative z-10">
+                            <div>
+                                <span class="font-bold text-white text-sm block flex items-center gap-2">
+                                    <img src="${this.getCoinIcon(d.coin)}" class="w-4 h-4 rounded-full"> ${d.coin}
+                                </span>
+                                <span class="${d.diType==='sell_high'?'text-red-400':'text-emerald-400'} font-bold text-[10px] uppercase tracking-wider border border-gray-700 px-1 rounded bg-black/30">
+                                    ${d.diType==='sell_high' ? 'Sell High' : 'Buy Low'}
+                                </span>
+                            </div>
+                            <div class="flex gap-2">
+                                <button onclick="app.editTransaction('${d.id}')" class="p-1 hover:bg-white/10 rounded"><i class="fa-solid fa-pen text-neon-blue text-xs"></i></button>
+                                <button onclick="app.softDel('${d.id}')" class="p-1 hover:bg-white/10 rounded"><i class="fa-solid fa-trash text-gray-500 hover:text-red-500 text-xs"></i></button>
+                            </div>
+                        </div>
+                        
+                        <div class="grid grid-cols-2 gap-y-3 gap-x-2 text-[10px] text-gray-400 mb-3 relative z-10">
+                            <div class="flex flex-col">
+                                <span>Target Price</span>
+                                <b class="text-white font-mono text-xs">${this.formatNumber(d.targetPrice)}</b>
+                            </div>
+                            <div class="flex flex-col text-right">
+                                <span>Current Price</span>
+                                <b class="${isWinCondition ? 'text-neon-gold animate-pulse' : 'text-white'} font-mono text-xs">${this.formatNumber(price)}</b>
+                            </div>
+                            <div class="flex flex-col">
+                                <span>Amount + Interest</span>
+                                <b class="text-neon-green font-mono">${this.formatNumber(finalVal)} ${d.diType==='sell_high'?d.coin:'USDT'}</b>
+                            </div>
+                            <div class="flex flex-col text-right">
+                                <span>APR / Duration</span>
+                                <b class="text-neon-gold font-mono">${d.apr}% / ${d.duration}d</b>
+                            </div>
+                        </div>
+
+                        <div class="flex gap-2 justify-end border-t border-gray-700/50 pt-2 relative z-10">
+                            <div class="text-[9px] text-gray-500 flex items-center mr-auto font-mono">
+                                <i class="fa-regular fa-clock mr-1"></i> ${d.date.slice(5,10)}
+                            </div>
+                            <button onclick="app.settleDI('${d.id}', false)" class="text-[10px] bg-gray-800 border border-gray-600 text-gray-300 px-3 py-1.5 rounded hover:bg-gray-700 font-bold transition">
+                                Không khớp
+                            </button>
+                            <button onclick="app.settleDI('${d.id}', true)" class="text-[10px] bg-gradient-to-r from-yellow-600 to-yellow-500 text-white px-3 py-1.5 rounded hover:opacity-90 font-bold shadow-[0_0_10px_rgba(234,179,8,0.3)] transition">
+                                Khớp lệnh
+                            </button>
+                        </div>
+                        
+                        <div class="absolute right-0 top-0 bottom-0 w-1/2 bg-gradient-to-l ${isWinCondition ? 'from-yellow-500/5' : 'from-transparent'} to-transparent pointer-events-none"></div>
+                    </div>`; 
+                }); 
+                
+                // Phần hiển thị lịch sử giữ nguyên logic sort cũ nhưng làm đẹp hơn chút
+                const sortF = document.getElementById('di-hist-sort')?document.getElementById('di-hist-sort').value:'desc'; 
+                const historyDI = this.data.transactions.filter(t => t.type === 'di_settle' && !t.deleted); 
+                historyDI.sort((a,b) => sortF === 'desc' ? new Date(b.date) - new Date(a.date) : new Date(a.date) - new Date(b.date)); 
+                
+                historyDI.forEach(h => { 
+                    const p = this.data.transactions.find(t => t.id === h.parentDiId); 
+                    if(!p) return; 
+                    const isProfit = (p.diType==='sell_high' && h.resultAsset==='USDT') || (p.diType==='buy_low' && h.resultAsset!=='USDT'); // Logic màu sắc đơn giản
+                    
+                    hi.innerHTML += `
+                    <tr class="border-b border-gray-800 hover:bg-white/5 transition group">
+                        <td class="p-3">
+                            <div class="font-bold text-white text-xs flex items-center gap-2">
+                                ${p.coin} <span class="text-[9px] px-1 rounded ${p.diType==='sell_high'?'bg-red-500/20 text-red-400':'bg-emerald-500/20 text-emerald-400'}">${p.diType==='sell_high'?'SELL':'BUY'}</span>
+                            </div>
+                            <div class="text-[9px] text-gray-500 font-mono">${h.date.slice(0,10)}</div>
+                        </td>
+                        <td class="p-3 text-right">
+                            <div class="font-bold text-xs text-white">
+                                ${this.formatNumber(h.resultAmount)} <span class="text-[9px] text-neon-gold">${h.resultAsset}</span>
+                            </div>
+                            <div class="text-[9px] text-gray-500">Gốc: ${this.formatNumber(p.amount)} ${p.diType==='sell_high'?p.coin:'USDT'}</div>
+                        </td>
+                        <td class="p-3 text-right w-10 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <button onclick="app.softDel('${h.id}')" title="Xóa lịch sử"><i class="fa-solid fa-trash text-gray-600 hover:text-red-500 text-xs"></i></button>
+                        </td>
+                    </tr>`; 
+                }); 
+            },
             openDIModal() { document.getElementById('modal-di').classList.remove('hidden'); document.getElementById('modal-di').classList.add('flex'); this.renderDICalculator(); },
             renderDICalculator() { const amount = parseFloat(document.getElementById('di-amount').value) || 0; const apr = parseFloat(document.getElementById('di-apr').value) || 0; const duration = parseFloat(document.getElementById('di-duration').value) || 1; const target = parseFloat(document.getElementById('di-target-price').value) || 0; const type = document.querySelector('input[name="diType"]:checked').value; const asset = (document.getElementById('di-asset').value || 'COIN').toUpperCase(); const coin = document.getElementById('di-asset').value.toUpperCase(); const price = this.getRate(coin); document.getElementById('di-live-price').innerText = price > 0 ? `Live: ${this.formatNumber(price)}` : ''; let bal = 0; if(type === 'sell_high') bal = this.getAssetBalance(coin); else bal = this.data.usdtBalance || this.getAssetBalance('USDT'); document.getElementById('di-balance-display').innerText = `Avail: ${this.formatNumber(bal)} ${type==='sell_high'?coin:'USDT'}`; document.getElementById('di-type-high').style.opacity = type === 'sell_high' ? '1' : '0.5'; document.getElementById('di-type-high').style.borderColor = type === 'sell_high' ? '#FF4D4D' : '#333'; document.getElementById('di-type-low').style.opacity = type === 'buy_low' ? '1' : '0.5'; document.getElementById('di-type-low').style.borderColor = type === 'buy_low' ? '#00FF9D' : '#333'; const interest = amount * (apr/100) * (duration/365); const totalAsset = amount + interest; if(type === 'sell_high') { document.getElementById('val-below-main').innerHTML = `${this.formatNumber(totalAsset, false)} <span class="text-neon-gold text-[10px]">${asset}</span>`; document.getElementById('val-above-main').innerHTML = `${this.formatNumber(totalAsset * target, false)} <span class="text-neon-green text-[10px]">USDT</span>`; } else { document.getElementById('val-below-main').innerHTML = `${this.formatNumber(totalAsset / target, false)} <span class="text-neon-gold text-[10px]">${asset}</span>`; document.getElementById('val-above-main').innerHTML = `${this.formatNumber(totalAsset, false)} <span class="text-neon-green text-[10px]">USDT</span>`; } },
             saveDITransaction() { const coin = document.getElementById('di-asset').value.toUpperCase(); if(!coin) return alert("Vui lòng nhập tên Coin!"); const type = document.querySelector('input[name="diType"]:checked').value; const amount = parseFloat(document.getElementById('di-amount').value); const isSellHigh = type === 'sell_high'; const checkCoin = isSellHigh ? coin : 'USDT'; let available = this.getAssetBalance(checkCoin); if(this.data.editingId) { const oldTx = this.data.transactions.find(t=>t.id===this.data.editingId); if(oldTx && !oldTx.deleted) { if(oldTx.diType === 'sell_high' && isSellHigh && oldTx.coin === coin) available += oldTx.amount; if(oldTx.diType === 'buy_low' && !isSellHigh) available += oldTx.amount; } } if(available < amount) return alert(`Số dư không đủ! Có: ${this.formatNumber(available)} ${checkCoin}, Cần: ${this.formatNumber(amount)}`); const payload = { type: 'di_entry', diType: type, coin: coin, targetPrice: parseFloat(document.getElementById('di-target-price').value), amount: amount, apr: parseFloat(document.getElementById('di-apr').value), duration: parseFloat(document.getElementById('di-duration').value), date: document.getElementById('di-start-date').value, settled: false }; if (this.data.editingId) { const idx = this.data.transactions.findIndex(x => x.id === this.data.editingId); if(idx !== -1) { this.data.transactions[idx] = { ...this.data.transactions[idx], ...payload }; this.showToast('Cập nhật thành công', 'success'); } } else { this.pushTx(payload); } this.saveData(); this.closeModal('di'); this.data.editingId = null; },
-            settleDI(id, isWin) { const di = this.data.transactions.find(t => t.id === id); if(!di) return; const actionText = isWin ? "KHỚP LỆNH (Win)" : "KHÔNG KHỚP (Fail)"; if(!confirm(`Xác nhận kết quả: ${actionText}?`)) return; di.settled = true; const interest = di.amount * (di.apr/100) * (di.duration/365); let resultAmount = 0, resultAsset = ''; if(di.diType === 'sell_high') { if(isWin) { resultAmount = (di.amount + interest) * di.targetPrice; resultAsset = 'USDT'; } else { resultAmount = di.amount + interest; resultAsset = di.coin; } } else { if(isWin) { resultAmount = (di.amount + interest) / di.targetPrice; resultAsset = di.coin; } else { resultAmount = di.amount + interest; resultAsset = 'USDT'; } } this.data.transactions.push({ id: crypto.randomUUID(), type: 'di_settle', parentDiId: id, date: new Date().toISOString(), resultAmount: resultAmount, resultAsset: resultAsset, deleted: false }); this.saveData(); this.renderDIView(); this.showToast('Đã tất toán thành công!', 'success'); },
-            // === END DI FUNCTIONS ===
-            saveSpotTransaction() { const type=document.querySelector('input[name="spotType"]:checked').value; const coin=document.getElementById('spot-coin').value.toUpperCase(); if(!coin) return alert("Nhập coin!"); const isBuy = type === 'buy'; const total = parseFloat(document.getElementById('spot-total').value); const amount = parseFloat(document.getElementById('spot-amount').value); const fee = parseFloat(document.getElementById('spot-fee').value) || 0; const checkCoin = isBuy ? 'USDT' : coin; const checkAmount = isBuy ? total + fee : amount; let available = this.getAssetBalance(checkCoin); if(this.data.editingId) { const oldTx = this.data.transactions.find(t=>t.id===this.data.editingId); if(oldTx && !oldTx.deleted) { if(oldTx.type === 'buy' && isBuy) available += (oldTx.total + (oldTx.fee||0)); if(oldTx.type === 'sell' && !isBuy && oldTx.coin === coin) available += oldTx.amount; } } if(available < checkAmount) return alert(`Số dư không đủ! Có: ${this.formatNumber(available)} ${checkCoin}, Cần: ${this.formatNumber(checkAmount)}`); const payload = { type, coin, price:parseFloat(document.getElementById('spot-price').value), amount:amount, total:total, fee: fee, date:document.getElementById('spot-date').value }; if (this.data.editingId) { const idx = this.data.transactions.findIndex(x => x.id === this.data.editingId); if(idx !== -1) { this.data.transactions[idx] = { ...this.data.transactions[idx], ...payload }; this.saveData(); this.closeModal('transaction'); this.showToast('Cập nhật thành công', 'success'); } } else { this.pushTx(payload); } this.data.editingId = null; },
+            settleDI(id, isWin) { 
+                const di = this.data.transactions.find(t => t.id === id); 
+                if(!di) return; 
+                
+                const actionText = isWin ? "KHỚP LỆNH (Giá đạt Target)" : "KHÔNG KHỚP (Giá không đạt Target)"; 
+                if(!confirm(`Xác nhận kết quả: ${actionText}?\n\nHành động này sẽ mở khóa tài sản và cộng lãi vào tài khoản.`)) return; 
+                
+                di.settled = true; 
+                const interest = di.amount * (di.apr/100) * (di.duration/365); 
+                let resultAmount = 0, resultAsset = ''; 
+                
+                if(di.diType === 'sell_high') { 
+                    if(isWin) { 
+                        // Sell High Khớp lệnh: Bán hết Coin + Lãi tại giá Target -> Nhận USDT
+                        resultAmount = (di.amount + interest) * di.targetPrice; 
+                        resultAsset = 'USDT'; 
+                    } else { 
+                        // Không khớp: Nhận về Coin gốc + Lãi Coin
+                        resultAmount = di.amount + interest; 
+                        resultAsset = di.coin; 
+                    } 
+                } else { 
+                    // BUY LOW
+                    if(isWin) { 
+                        // Buy Low Khớp lệnh: Dùng USDT mua Coin tại giá Target
+                        resultAmount = (di.amount + interest) / di.targetPrice; 
+                        resultAsset = di.coin; 
+                    } else { 
+                        // Không khớp: Nhận về USDT gốc + Lãi USDT
+                        resultAmount = di.amount + interest; 
+                        resultAsset = 'USDT'; 
+                    } 
+                } 
+                
+                // Tạo transaction settle mới
+                this.data.transactions.push({ 
+                    id: crypto.randomUUID(), 
+                    type: 'di_settle', 
+                    parentDiId: id, 
+                    date: new Date().toISOString(), 
+                    resultAmount: resultAmount, 
+                    resultAsset: resultAsset, 
+                    deleted: false 
+                }); 
+                
+                this.saveData(); 
+                this.renderDIView(); 
+                this.showToast('Đã tất toán thành công!', 'success'); 
+            },
             saveFiatTransaction() { const type=document.querySelector('input[name="fiatType"]:checked').value, amt=parseFloat(document.getElementById('fiat-amount').value), r=parseFloat(document.getElementById('fiat-rate').value), u=document.getElementById('fiat-unit').value, fee=parseFloat(document.getElementById('fiat-fee').value) || 0; if(!amt) return alert("Nhập số lượng!"); const realAmount = u==='VND'?amt/r:amt; if(type === 'withdraw') { let available = this.getAssetBalance('USDT'); if(this.data.editingId) { const oldTx = this.data.transactions.find(t=>t.id===this.data.editingId); if(oldTx && !oldTx.deleted && oldTx.type === 'withdraw') available += (oldTx.amount + (oldTx.fee||0)); } if(available < realAmount + fee) return alert(`Số dư không đủ! Có: ${this.formatNumber(available)} USDT, Cần: ${this.formatNumber(realAmount + fee)}`); } const payload = { type, amount: realAmount, fee: fee, rate:r, date:new Date().toISOString() }; if (this.data.editingId) { const idx = this.data.transactions.findIndex(x => x.id === this.data.editingId); if(idx !== -1) { this.data.transactions[idx] = { ...this.data.transactions[idx], ...payload }; this.saveData(); this.closeModal('transaction'); this.showToast('Cập nhật thành công', 'success'); } } else { this.pushTx(payload); } this.data.editingId = null; },
             pushTx(d) { this.data.transactions.push({ id: crypto.randomUUID(), ...d, deleted: false }); this.saveData(); this.closeModal('transaction'); this.showToast('Lưu thành công', 'success'); },
             toggleSmallAssets() { this.data.hideSmallAssets = document.getElementById('hide-small-assets').checked; this.renderPortfolio(); },
